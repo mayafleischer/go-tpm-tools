@@ -228,6 +228,105 @@ func getUptime() (string, error) {
 	return string(split[0]), nil
 }
 
+func startLauncher(launchSpec spec.LaunchSpec, serialConsole *os.File) error {
+	logger.Info(fmt.Sprintf("Launch Spec: %+v", launchSpec.LogFriendly()))
+	containerdClient, err := containerd.New(defaults.DefaultAddress)
+	if err != nil {
+		return &launcher.RetryableError{Err: err}
+	}
+	defer containerdClient.Close()
+
+	tpm, err := initTPM(launchSpec)
+	if err != nil {
+		return err
+	}
+	if tpm != nil {
+		defer tpm.Close()
+	}
+
+	token, err := registryauth.RetrieveAuthToken(context.Background(), mdsClient)
+	if err != nil {
+		logger.Info(fmt.Sprintf("failed to retrieve auth token: %v, using empty auth for image pulling\n", err))
+	}
+	ctx := namespaces.WithNamespace(context.Background(), namespaces.Default)
+
+	if launchSpec.InstallGpuDriver {
+		installer := gpu.NewDriverInstaller(containerdClient, launchSpec, logger)
+		err = installer.InstallGPUDrivers(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to install gpu drivers: %v", err)
+		}
+	} else {
+		// TODO: Remove this when BC GPU installation is supported
+		if !launchSpec.Experiments.BcMode {
+			deviceInfo, _ := deviceinfo.GetGPUTypeInfo()
+			if deviceInfo != deviceinfo.NO_GPU {
+				logger.Error("GPU is attached, tee-install-gpu-driver is not set")
+				return fmt.Errorf("failed to install GPU drivers: tee-install-gpu-driver must be set to true")
+			}
+		}
+	}
+
+	logger.Info("Launch started", "duration_sec", time.Since(start).Seconds())
+
+	// tpm is nil when running in BC mode.
+	r, err := launcher.NewRunner(ctx, containerdClient, token, launchSpec, mdsClient, tpm, logger, serialConsole)
+	if err != nil {
+		return err
+	}
+	defer r.Close(ctx)
+
+	return r.Run(ctx)
+}
+
+func initTPM(launchSpec spec.LaunchSpec) (io.ReadWriteCloser, error) {
+	if launchSpec.Experiments.BcMode {
+		logger.Info("Running in BC mode, bypassing TPM initialization and checks.")
+		return nil, nil
+	}
+
+	tpm, err := tpm2.OpenTPM("/dev/tpmrm0")
+	if err != nil {
+		return nil, &launcher.RetryableError{Err: err}
+	}
+
+	// check DA info, don't crash if failed
+	daInfo, err := launcher.GetTPMDAInfo(tpm)
+	if err != nil {
+		logger.Error(fmt.Sprintf("Failed to get DA Info: %v", err))
+	} else {
+		if !daInfo.StartupClearOrderly {
+			logger.Warn(fmt.Sprintf("Failed orderly startup. Avoid using instance reset. Instead, use instance stop/start. DA lockout counter incremented: LockoutCounter: %d / MaxAuthFail: %d", daInfo.LockoutCounter, daInfo.MaxTries))
+		}
+
+		if err := launcher.SetTPMDAParams(tpm, expectedTPMDAParams); err != nil {
+			logger.Error(fmt.Sprintf("Failed to set DA params: %v", err))
+		}
+
+		daInfo, err := launcher.GetTPMDAInfo(tpm)
+		if err != nil {
+			logger.Error(fmt.Sprintf("Failed to get DA Info: %v", err))
+		} else {
+			logger.Info(fmt.Sprintf("Updated TPM DA params: %+v", daInfo))
+		}
+	}
+
+	// check AK (EK signing) cert
+	gceAk, err := client.GceAttestationKeyECC(tpm)
+	if err != nil {
+		tpm.Close()
+		return nil, err
+	}
+	defer gceAk.Close()
+
+	if gceAk.Cert() == nil {
+		tpm.Close()
+		return nil, errors.New("failed to find AKCert on this VM: try creating a new VM or contacting support")
+	}
+
+	return tpm, nil
+}
+
 // verifyFsAndMount checks the partitions/mounts are as expected, based on the command output reported by OS.
 // These checks are not a security guarantee.
 func verifyDiskIntegrity(verifier integrityVerifier) error {
